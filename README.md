@@ -131,10 +131,14 @@ Name: HUNTER_ENABLED
 Value: true
 ```
 
-Lịch mặc định: **phút 23, mỗi 2 giờ**, theo UTC; mỗi job tối đa **5 phút**. Chỉ chạy
+Lịch mặc định: **mỗi 45 phút**, theo UTC; mỗi job tối đa **5 phút**. Chỉ chạy
 ngắn để kiểm tra/cấp hạ tầng, không giữ runner ngủ chờ giữa các lần săn.
-Với 31 ngày, lịch này có tối đa khoảng 372 lượt; nếu mỗi lượt đủ 5 phút thì khoảng
-1.860 phút Linux. Đây là ước tính, không phải cam kết hóa đơn bằng 0; còn phụ thuộc
+Workflow dùng ba biểu thức cron để giữ khoảng cách 45 phút cả khi qua giờ/ngày:
+`23 0-23/3 * * *`, `8,53 1-23/3 * * *`, `38 2-23/3 * * *`.
+Ví dụ theo giờ Việt Nam: **07:23 → 08:08 → 08:53 → 09:38 → 10:23**.
+Không dùng `*/45` vì cách đó xen kẽ khoảng cách 45 và 15 phút.
+Với 31 ngày, lịch này có tối đa khoảng 992 lượt; nếu mỗi lượt đủ 5 phút thì khoảng
+4.960 phút Linux. Đây là ước tính, không phải cam kết hóa đơn bằng 0; còn phụ thuộc
 plan, cách đo sử dụng và các workflow khác của tài khoản.
 
 Với repo riêng, kiểm tra **Billing → Actions** và ngân sách/chặn sử dụng trả phí trước

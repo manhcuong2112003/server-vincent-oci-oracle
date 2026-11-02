@@ -9,8 +9,11 @@ on:
         options: [setup, tick, status]
         default: setup
   schedule:
-    # Every two hours, away from the top of the hour. Enable using repository variable below.
-    - cron: '23 */2 * * *'
+    # Every 45 minutes across hour/day boundaries (UTC): 00:23, 01:08, 01:53, 02:38, ...
+    # Enable with HUNTER_ENABLED=true. Three expressions keep every gap at 45 minutes.
+    - cron: '23 0-23/3 * * *'
+    - cron: '8,53 1-23/3 * * *'
+    - cron: '38 2-23/3 * * *'
 
 permissions:
   contents: read
