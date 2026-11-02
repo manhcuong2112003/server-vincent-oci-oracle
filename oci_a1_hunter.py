@@ -112,10 +112,16 @@ class API:
             if result.returncode == 0:
                 if file_output:
                     return None
+                # OCI CLI emits no stdout for a successful list with zero results.
+                # Only list reads may use this representation; missing get/write
+                # responses must still stop rather than hide an unknown outcome.
+                if not result.stdout.strip() and not write and args[2:3] == ("list",):
+                    return {"data": []}
                 try:
                     return json.loads(result.stdout)
                 except ValueError as exc:
-                    raise Stop("OCI CLI tra ve du lieu JSON khong hop le.") from exc
+                    command = " ".join(args[:3])
+                    raise Stop("OCI CLI tra ve du lieu JSON khong hop le (%s)." % command) from exc
             error = (result.stderr or result.stdout)[-1800:]
             transient = re.search(r"429|TooManyRequests|TooManyRequestsPerUser|\b50[0234]\b|throttl", error, re.I)
             if not write and transient and attempt < 3:

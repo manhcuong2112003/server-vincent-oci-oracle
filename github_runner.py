@@ -238,10 +238,12 @@ def main():
     except Busy as exc:
         log(str(exc))
         return 0
-    hunter = None
-    try:
-        with tempfile.TemporaryDirectory() as directory:
-            args.state_dir = directory
+    # Keep local state alive while the error handler persists the stop reason
+    # and pending notification to Object Storage.
+    with tempfile.TemporaryDirectory() as directory:
+        args.state_dir = directory
+        hunter = None
+        try:
             hunter = ShortHunter(args, api, store)
             if args.command == "setup":
                 hunter.setup_email()
@@ -253,24 +255,24 @@ def main():
             terminal = hunter.tick(config["tenancy"])
             output_terminal(terminal)
             return 0
-    except (Stop, oci.exceptions.ServiceError, ValueError) as exc:
-        log("DUNG: " + str(exc))
-        if hunter:
-            if hunter.state.get("success") or hunter.state.get("outbox"):
-                # Leave delivery resumable. Do not overwrite an unsent success notice.
-                log("Thong bao chua gui xong; giu schedule de thu gui lai.")
-            elif hunter.state.get("intent") and hunter.state.get("intent_checks", 0) < 3:
-                hunter.state["intent_checks"] = hunter.state.get("intent_checks", 0) + 1
-                hunter.save()
-                log("Chua ro ket qua gui job; giu schedule de tim lai, khong gui job trung.")
-            else:
-                hunter.state["stopped"] = str(exc)
-                hunter.save()
-                hunter.notify("OCI A1: action required", str(exc), "stopped")
-                output_terminal(True)
-        return 2
-    finally:
-        store.release()
+        except (Stop, oci.exceptions.ServiceError, ValueError) as exc:
+            log("DUNG: " + str(exc))
+            if hunter:
+                if hunter.state.get("success") or hunter.state.get("outbox"):
+                    # Leave delivery resumable. Do not overwrite an unsent success notice.
+                    log("Thong bao chua gui xong; giu schedule de thu gui lai.")
+                elif hunter.state.get("intent") and hunter.state.get("intent_checks", 0) < 3:
+                    hunter.state["intent_checks"] = hunter.state.get("intent_checks", 0) + 1
+                    hunter.save()
+                    log("Chua ro ket qua gui job; giu schedule de tim lai, khong gui job trung.")
+                else:
+                    hunter.state["stopped"] = str(exc)
+                    hunter.save()
+                    hunter.notify("OCI A1: action required", str(exc), "stopped")
+                    output_terminal(True)
+            return 2
+        finally:
+            store.release()
 
 
 if __name__ == "__main__":
