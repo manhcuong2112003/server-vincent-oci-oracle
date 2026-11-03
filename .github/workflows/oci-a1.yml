@@ -55,7 +55,10 @@ jobs:
           target = Path.home() / '.oci'
           target.mkdir(mode=0o700, exist_ok=True)
           key = target / 'github_api_key.pem'
-          key.write_text(os.environ['OCI_PRIVATE_KEY'].strip() + '\n', encoding='utf-8')
+          private_key = os.environ['OCI_PRIVATE_KEY'].strip()
+          if not private_key.endswith('OCI_API_KEY'):
+              private_key += '\nOCI_API_KEY'
+          key.write_text(private_key + '\n', encoding='utf-8')
           key.chmod(0o600)
           config = target / 'config'
           config.write_text('[DEFAULT]\nuser={}\ntenancy={}\nfingerprint={}\nkey_file={}\nregion=ap-singapore-1\n'.format(

@@ -32,6 +32,24 @@ class Stop(RuntimeError):
     pass
 
 
+class RateLimited(Stop):
+    """Oracle explicitly rejected a request with HTTP 429; defer the next tick."""
+    pass
+
+
+def cli_error_payload(text):
+    """Read a structured OCI error even when CLI warnings precede its JSON."""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"(?m)^\s*\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start():].lstrip())
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and "status" in payload and "code" in payload:
+            return payload
+    return {}
+
+
 def log(message):
     print("[%s] %s" % (dt.datetime.now().astimezone().isoformat(timespec="seconds"), message), flush=True)
 
@@ -122,13 +140,19 @@ class API:
                 except ValueError as exc:
                     command = " ".join(args[:3])
                     raise Stop("OCI CLI tra ve du lieu JSON khong hop le (%s)." % command) from exc
-            error = (result.stderr or result.stdout)[-1800:]
+            error_output = result.stderr or result.stdout
+            payload = cli_error_payload(error_output)
+            rate_limited = (payload.get("status") == 429
+                            and payload.get("code") in ("TooManyRequests", "TooManyRequestsPerUser"))
+            error = error_output[-1800:]
             transient = re.search(r"429|TooManyRequests|TooManyRequestsPerUser|\b50[0234]\b|throttl", error, re.I)
             if not write and transient and attempt < 3:
                 delay = min(60, 5 * 2 ** attempt) + random.randint(0, 5)
                 log("API tam thoi ban; cho %s giay." % delay)
                 time.sleep(delay)
                 continue
+            if rate_limited:
+                raise RateLimited("Oracle gioi han tan suat (HTTP 429 TooManyRequests); cho luot sau.")
             raise Stop("OCI CLI error: " + error)
 
 
@@ -251,12 +275,20 @@ class Hunter:
         name = "a1-hunt-%s-%s" % (operation.lower(), uuid.uuid4().hex[:16])
         # Persist BEFORE the API call: a lost response must not create duplicate jobs.
         self.state["intent"] = {"name": name, "operation": operation}
+        self.state.pop("intent_checks", None)
         self.save()
         command = ["resource-manager", "job", "create-" + operation.lower() + "-job",
                    "--stack-id", self.args.stack_id, "--display-name", name]
         if operation == "APPLY":
             command += ["--execution-plan-strategy", "FROM_PLAN_JOB_ID", "--execution-plan-job-id", plan_id]
-        response = self.api.call(*command, write=True)["data"]
+        try:
+            response = self.api.call(*command, write=True)["data"]
+        except RateLimited:
+            # Check for an accepted job by name on the next tick before retrying.
+            # Keep the checked PLAN in pending when an APPLY was throttled.
+            self.state["intent"]["throttled"] = True
+            self.save()
+            raise
         self.state["pending"] = response["id"]
         self.state.pop("intent", None)
         self.save()
@@ -266,12 +298,18 @@ class Hunter:
         intent = self.state.get("intent")
         if intent:
             matches = [job for job in jobs if job.get("display-name") == intent["name"]]
-            if len(matches) != 1:
+            if not matches and intent.get("throttled"):
+                self.state.pop("intent", None)
+                self.state.pop("intent_checks", None)
+                self.save()
+                log("Yeu cau truoc bi gioi han tan suat; khong co job da nhan. Tiep tuc tu plan da luu.")
+            elif len(matches) != 1:
                 raise Stop("Lan gui job truoc chua ro ket qua (%s). Kiem tra Console; khong tu gui job trung."
                            % intent["name"])
-            self.state["pending"] = matches[0]["id"]
-            self.state.pop("intent", None)
-            self.save()
+            else:
+                self.state["pending"] = matches[0]["id"]
+                self.state.pop("intent", None)
+                self.save()
         active = [job for job in jobs if job.get("lifecycle-state") in ACTIVE]
         if len(active) > 1:
             raise Stop("Stack co nhieu job dang chay. Hay cho chung ket thuc.")

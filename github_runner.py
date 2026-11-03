@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 
-from oci_a1_hunter import API, Hunter, Stop, STACK, REGION, EMAIL, ACTIVE, log, rows
+from oci_a1_hunter import API, Hunter, Stop, RateLimited, STACK, REGION, EMAIL, ACTIVE, log, rows
 
 
 class Busy(Stop):
@@ -254,6 +254,11 @@ def main():
                 return 0
             terminal = hunter.tick(config["tenancy"])
             output_terminal(terminal)
+            return 0
+        except RateLimited as exc:
+            log(str(exc))
+            log("Tam hoan vi Oracle gioi han tan suat; giu lich, khong gui lai job trong luot nay.")
+            output_terminal(False)
             return 0
         except (Stop, oci.exceptions.ServiceError, ValueError) as exc:
             log("DUNG: " + str(exc))

@@ -156,6 +156,9 @@ tắt scheduled workflow, xem [schedule](https://docs.github.com/en/actions/refe
 - Apply thành công: lưu trạng thái trước, gửi mail kèm link job, **tự disable workflow**.
 - Lỗi không phải capacity: lưu lý do dừng, báo mail rồi tắt workflow để bạn kiểm tra.
 - Email tạm lỗi: giữ thông báo chưa gửi trên Oracle để lượt sau gửi lại; không tạo thêm VM.
+- Oracle trả `429 TooManyRequests`: tạm hoãn đến lượt quét sau, giữ lịch 45 phút.
+  Nếu bị giới hạn khi tạo job, lượt sau tìm job theo tên trước khi thử lại để tránh tạo trùng.
+  Lượt bị hoãn có thể vẫn hiện dấu xanh trên GitHub; xem log để phân biệt với tạo máy thành công.
 - Phản hồi tạo job không rõ: đã lưu ý định trước khi gửi, lượt sau tìm lại job theo tên;
   nếu chưa xác định được thì dừng thay vì gửi thêm job trùng.
 - Runner bị timeout: lease tự hết hạn sau 15 phút, lượt sau tiếp tục từ state đã lưu.
