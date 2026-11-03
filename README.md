@@ -6,8 +6,9 @@ stack nếu chưa có ổ khác. Workflow giữ nguyên stack đã lưu; không 
 đổi shape. Không có cấu hình A1 24 GB miễn phí chạy cả tháng cho loại tài khoản này
 theo hạn mức Oracle hiện công bố.
 
-**Chưa được triển khai lên GitHub/Oracle.** Code được kiểm thử cục bộ bằng dữ liệu
-giả lập; cần làm các bước dưới đây bằng tài khoản của bạn.
+Repo đã được cấu hình chạy trên GitHub Actions và lưu tiến độ trên Oracle.
+Các bước dưới đây dùng để thiết lập lại khi cần; dấu xanh của Actions chưa có nghĩa
+là máy đã được tạo thành công.
 
 ## 1. Đặt các file vào repo dự án của bạn
 
@@ -131,24 +132,30 @@ Name: HUNTER_ENABLED
 Value: true
 ```
 
-Lịch mặc định: **mỗi 45 phút**, theo UTC; mỗi job tối đa **5 phút**. Chỉ chạy
-ngắn để kiểm tra/cấp hạ tầng, không giữ runner ngủ chờ giữa các lần săn.
-Workflow dùng ba biểu thức cron để giữ khoảng cách 45 phút cả khi qua giờ/ngày:
-`23 0-23/3 * * *`, `8,53 1-23/3 * * *`, `38 2-23/3 * * *`.
-Ví dụ theo giờ Việt Nam: **07:23 → 08:08 → 08:53 → 09:38 → 10:23**.
-Không dùng `*/45` vì cách đó xen kẽ khoảng cách 45 và 15 phút.
-Với 31 ngày, lịch này có tối đa khoảng 992 lượt; nếu mỗi lượt đủ 5 phút thì khoảng
-4.960 phút Linux. Đây là ước tính, không phải cam kết hóa đơn bằng 0; còn phụ thuộc
-plan, cách đo sử dụng và các workflow khác của tài khoản.
+Workflow được đánh thức **mỗi 15 phút**, bằng cron `8,23,38,53 * * * *` (UTC).
+Mỗi lượt tự động đọc thời điểm quét gần nhất trên Oracle và chỉ săn khi đã đủ
+**45 phút**. Việc kiểm tra và ghi thời điểm dùng chung lease với thao tác triển khai,
+nên các lượt đến sát nhau không tạo thêm lần săn. State cũ chưa có thời điểm sẽ
+được quét ngay. Mỗi job tối đa **5 phút**, không giữ runner ngủ giữa các lần săn.
+
+Nếu GitHub bỏ lỡ một lần đánh thức, lần tiếp theo sẽ kiểm tra lại thời điểm đến hạn.
+Khi GitHub chạy đều, khoảng cách thực tế thường là 45–60 phút, tùy độ trễ; GitHub
+vẫn có thể trễ hoặc bỏ lượt, nên không bảo đảm chạy đúng giờ hay khắc phục mọi sự cố
+của hệ thống lịch. `status` hiển thị thời điểm quét gần nhất theo UTC.
+
+Push thay đổi workflow hoặc mã triển khai lên `main` cũng đánh thức chương trình
+khi `HUNTER_ENABLED=true`, có cùng giới hạn 45 phút. Chạy thủ công mode `tick` là
+yêu cầu quét ngay và bỏ qua khoảng chờ. Mode `setup`/`status` không tính là lượt săn.
+Lịch có tối đa 96 lần đánh thức/ngày (2.976 lần trong 31 ngày); các lần chưa đến hạn
+sẽ kết thúc sớm. Đây không phải cam kết hóa đơn bằng 0; còn phụ thuộc plan và các
+workflow khác của tài khoản.
 
 Với repo riêng, kiểm tra **Billing → Actions** và ngân sách/chặn sử dụng trả phí trước
 khi bật lịch. GitHub hiện công bố GitHub Free có $12 included compute/tháng;
 runner Linux tiêu chuẩn có mức ví dụ $0.006/phút. Không tăng ngân sách trả phí để săn máy.
 [GitHub Actions billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
 
-Nếu repo dự án công khai và đủ điều kiện dùng standard hosted runner miễn phí,
-có thể đổi cron thành `23,53 * * * *` để thử mỗi 30 phút. Không tạo nhiều repo/tài khoản
-để né hạn mức. Lịch GitHub có thể trễ; repo công khai không hoạt động lâu có thể bị
+Không tạo nhiều repo/tài khoản để né hạn mức. Lịch GitHub có thể trễ; repo công khai không hoạt động lâu có thể bị
 tắt scheduled workflow, xem [schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
 ## Sau khi có máy hoặc gặp lỗi khác

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A short, resumable deployment tick for GitHub Actions. No daemon or sleep loop."""
 import argparse
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -131,6 +132,27 @@ class ShortHunter(Hunter):
         if not self.state.get("intent") and self.state.pop("intent_checks", None) is not None:
             self.save()
 
+    def run_tick(self, tenancy, min_interval_seconds=0):
+        """Gate automatic wakeups under the same remote lease as deployment."""
+        now = time.time()
+        previous = self.state.get("last_tick_started_at")
+        # Terminal states and unsent mail need attention even between scans.
+        terminal_pending = any(self.state.get(key) for key in ("success", "stopped", "outbox"))
+        if min_interval_seconds and previous is not None and not terminal_pending:
+            remaining = previous + min_interval_seconds - now
+            if remaining > 0:
+                log("Chua du 45 phut; bo qua quet, con %.0f giay." % remaining)
+                return False
+        # Save before calling Oracle so delayed/duplicate wakeups and timeouts
+        # cannot cause multiple deployment attempts inside the interval.
+        self.state["last_tick_started_at"] = now
+        self.save()
+        log("Bat dau luot quet; khoang cach toi thieu %s giay." % min_interval_seconds)
+        terminal = self.tick(tenancy)
+        self.state["last_tick_finished_at"] = time.time()
+        self.save()
+        return terminal
+
     def finish_plan(self, tenancy):
         deadline = time.monotonic() + 60
         while True:
@@ -213,6 +235,8 @@ def main():
     parser.add_argument("--stack-id", default=STACK)
     parser.add_argument("--region", default=REGION)
     parser.add_argument("--email", default=EMAIL)
+    parser.add_argument("--min-interval-seconds", type=int, choices=(0, 2700), default=0,
+                        help="2700 for automatic wakeups; 0 for an explicit manual tick")
     args = parser.parse_args()
     # Imported only for real execution; pure logic is testable without OCI credentials.
     import oci
@@ -251,8 +275,12 @@ def main():
             if args.command == "status":
                 log("Stack: %s; success=%s; pending=%s; stopped=%s" % (
                     args.stack_id, hunter.state.get("success"), hunter.state.get("pending"), hunter.state.get("stopped")))
+                started = hunter.state.get("last_tick_started_at")
+                if started is not None:
+                    log("Luot quet gan nhat (UTC): " + dt.datetime.fromtimestamp(
+                        started, dt.timezone.utc).isoformat(timespec="seconds"))
                 return 0
-            terminal = hunter.tick(config["tenancy"])
+            terminal = hunter.run_tick(config["tenancy"], args.min_interval_seconds)
             output_terminal(terminal)
             return 0
         except RateLimited as exc:

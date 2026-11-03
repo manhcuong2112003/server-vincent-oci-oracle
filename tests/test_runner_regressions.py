@@ -113,6 +113,85 @@ class RunnerStateTests(unittest.TestCase):
         store.release.assert_called_once()
 
 
+class CadenceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.args = argparse.Namespace(state_dir=self.temp.name, stack_id=hunter.STACK,
+                                       region=hunter.REGION, email=hunter.EMAIL)
+        self.store = Mock()
+        self.saved = {'stack': hunter.STACK, 'region': hunter.REGION}
+        self.store.load.side_effect = lambda: json.loads(json.dumps(self.saved))
+        self.store.save.side_effect = self.persist
+
+    def persist(self, state):
+        self.saved = json.loads(json.dumps(state))
+
+    def subject(self):
+        return runner.ShortHunter(self.args, Mock(), self.store)
+
+    def test_duplicate_and_early_wakeups_after_restart_do_not_scan(self):
+        self.saved['last_tick_started_at'] = 10000
+        for now in (10000, 10900, 12699):
+            subject = self.subject()
+            with patch.object(runner.time, 'time', return_value=now), \
+                    patch.object(subject, 'tick') as tick:
+                self.assertFalse(subject.run_tick('tenancy', 2700))
+            tick.assert_not_called()
+        self.store.save.assert_not_called()
+
+    def test_boundary_and_missed_wakeup_scan_once_and_persist_before_call(self):
+        for now in (12700, 19000):
+            with self.subTest(now=now):
+                self.saved['last_tick_started_at'] = 10000
+                subject = self.subject()
+                def tick(tenancy):
+                    self.assertEqual(self.saved['last_tick_started_at'], now)
+                    self.assertEqual(tenancy, 'tenancy')
+                    return False
+                with patch.object(runner.time, 'time', return_value=now), \
+                        patch.object(subject, 'tick', side_effect=tick) as scan:
+                    self.assertFalse(subject.run_tick('tenancy', 2700))
+                scan.assert_called_once()
+                self.assertEqual(self.saved['last_tick_finished_at'], now)
+                restarted = self.subject()
+                with patch.object(runner.time, 'time', return_value=now + 10), \
+                        patch.object(restarted, 'tick') as duplicate:
+                    restarted.run_tick('tenancy', 2700)
+                duplicate.assert_not_called()
+
+    def test_legacy_state_without_timestamp_scans_immediately(self):
+        subject = self.subject()
+        with patch.object(subject, 'tick', return_value=False) as tick:
+            self.assertFalse(subject.run_tick('tenancy', 2700))
+        tick.assert_called_once_with('tenancy')
+
+    def test_timeout_or_rate_limit_still_reserves_interval(self):
+        subject = self.subject()
+        with patch.object(runner.time, 'time', return_value=10000), \
+                patch.object(subject, 'tick', side_effect=hunter.RateLimited('429')):
+            with self.assertRaises(hunter.RateLimited):
+                subject.run_tick('tenancy', 2700)
+        restarted = self.subject()
+        with patch.object(runner.time, 'time', return_value=10900), \
+                patch.object(restarted, 'tick') as duplicate:
+            restarted.run_tick('tenancy', 2700)
+        duplicate.assert_not_called()
+
+    def test_manual_tick_and_terminal_notifications_bypass_interval(self):
+        for terminal in (None, 'success', 'stopped', 'outbox'):
+            with self.subTest(terminal=terminal):
+                self.saved = {'stack': hunter.STACK, 'region': hunter.REGION,
+                              'last_tick_started_at': 10000}
+                if terminal:
+                    self.saved[terminal] = 'pending-delivery'
+                subject = self.subject()
+                with patch.object(runner.time, 'time', return_value=10001), \
+                        patch.object(subject, 'tick', return_value=True) as tick:
+                    self.assertTrue(subject.run_tick('tenancy', 2700 if terminal else 0))
+                tick.assert_called_once_with('tenancy')
+
+
 class RateLimitTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

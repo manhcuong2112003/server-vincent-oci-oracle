@@ -1,6 +1,12 @@
 name: Deploy Oracle A1 Always Free
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oci-a1.yml'
+      - 'github_runner.py'
+      - 'oci_a1_hunter.py'
   workflow_dispatch:
     inputs:
       mode:
@@ -9,11 +15,9 @@ on:
         options: [setup, tick, status]
         default: setup
   schedule:
-    # Every 45 minutes across hour/day boundaries (UTC): 00:23, 01:08, 01:53, 02:38, ...
-    # Enable with HUNTER_ENABLED=true. Three expressions keep every gap at 45 minutes.
-    - cron: '23 0-23/3 * * *'
-    - cron: '8,53 1-23/3 * * *'
-    - cron: '38 2-23/3 * * *'
+    # Wake every 15 minutes; remote state allows one scan per 45 minutes.
+    # Extra wakeups let the next event recover a delayed/dropped schedule.
+    - cron: '8,23,38,53 * * * *'
 
 permissions:
   contents: read
@@ -70,8 +74,9 @@ jobs:
         id: hunter
         env:
           MODE: ${{ inputs.mode || 'tick' }}
+          MIN_INTERVAL_SECONDS: ${{ github.event_name == 'workflow_dispatch' && '0' || '2700' }}
           OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
-        run: python github_runner.py "$MODE"
+        run: python github_runner.py "$MODE" --min-interval-seconds "$MIN_INTERVAL_SECONDS"
       - name: Stop schedule when deployment is complete or requires attention
         if: always() && steps.hunter.outputs.terminal == 'true'
         env:
