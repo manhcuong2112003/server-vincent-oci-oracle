@@ -132,8 +132,8 @@ def run_session(stack_id: str, region: str, session_minutes: int, retry_interval
                 stack_id=stack_id,
                 display_name=job_name,
                 operation="APPLY",
-                apply_job_plan_resolution=oci.resource_manager.models.CreateApplyJobPlanResolutionDetails(
-                    is_auto_approved=True
+                job_operation_details=oci.resource_manager.models.CreateApplyJobOperationDetails(
+                    execution_plan_strategy="AUTO_APPROVED"
                 )
             )
             job = rm_client.create_job(create_job_details).data
