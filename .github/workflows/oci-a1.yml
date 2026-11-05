@@ -3,21 +3,19 @@ name: Deploy Oracle A1 Always Free
 on:
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/oci-a1.yml'
-      - 'github_runner.py'
-      - 'oci_a1_hunter.py'
   workflow_dispatch:
     inputs:
-      mode:
-        description: "setup: create email subscription; tick: one deployment step; status: inspect progress"
-        type: choice
-        options: [setup, tick, status]
-        default: setup
+      session_minutes:
+        description: "Thời gian phiên săn (phút)"
+        type: number
+        default: 15
+      retry_interval:
+        description: "Khoảng cách giữa các lần thử (giây)"
+        type: number
+        default: 45
   schedule:
-    # Wake every 15 minutes; remote state allows one scan per 45 minutes.
-    # Extra wakeups let the next event recover a delayed/dropped schedule.
-    - cron: '8,23,38,53 * * * *'
+    # Đánh thức mỗi 30 phút để chạy 1 phiên săn 15 phút
+    - cron: '*/30 * * * *'
 
 permissions:
   contents: read
@@ -28,21 +26,24 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.event_name == 'workflow_dispatch' || vars.HUNTER_ENABLED == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install OCI CLI and SDK
-        run: python -m pip install --quiet --disable-pip-version-check 'oci-cli==3.95.1'
+
+      - name: Install Oracle Cloud SDK
+        run: |
+          python -m pip install --quiet --disable-pip-version-check oci
+
       - name: Configure Oracle credentials
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
@@ -53,32 +54,45 @@ jobs:
           python - <<'PY'
           import os
           from pathlib import Path
-          names = ['OCI_USER_OCID', 'OCI_TENANCY_OCID', 'OCI_FINGERPRINT', 'OCI_PRIVATE_KEY']
-          if any(not os.environ.get(name, '').strip() for name in names):
-              raise SystemExit('Missing Oracle repository secrets. See README.')
+
+          required = ['OCI_USER_OCID', 'OCI_TENANCY_OCID', 'OCI_FINGERPRINT', 'OCI_PRIVATE_KEY']
+          missing = [name for name in required if not os.environ.get(name, '').strip()]
+          if missing:
+              raise SystemExit(f"Thiếu các secret sau trong GitHub Secrets: {', '.join(missing)}")
+
           target = Path.home() / '.oci'
           target.mkdir(mode=0o700, exist_ok=True)
-          key = target / 'github_api_key.pem'
-          private_key = os.environ['OCI_PRIVATE_KEY'].strip()
-          if not private_key.endswith('OCI_API_KEY'):
-              private_key += '\nOCI_API_KEY'
-          key.write_text(private_key + '\n', encoding='utf-8')
-          key.chmod(0o600)
+
+          key_file = target / 'oci_api_key.pem'
+          key_content = os.environ['OCI_PRIVATE_KEY'].strip()
+          key_file.write_text(key_content + '\n', encoding='utf-8')
+          key_file.chmod(0o600)
+
           config = target / 'config'
-          config.write_text('[DEFAULT]\nuser={}\ntenancy={}\nfingerprint={}\nkey_file={}\nregion=ap-singapore-1\n'.format(
-              os.environ['OCI_USER_OCID'].strip(), os.environ['OCI_TENANCY_OCID'].strip(),
-              os.environ['OCI_FINGERPRINT'].strip(), key), encoding='utf-8')
+          config.write_text(
+              f"[DEFAULT]\n"
+              f"user={os.environ['OCI_USER_OCID'].strip()}\n"
+              f"tenancy={os.environ['OCI_TENANCY_OCID'].strip()}\n"
+              f"fingerprint={os.environ['OCI_FINGERPRINT'].strip()}\n"
+              f"key_file={key_file}\n"
+              f"region=ap-singapore-1\n",
+              encoding='utf-8'
+          )
           config.chmod(0o600)
+          print("Cấu hình xác thực OCI thành công.")
           PY
-      - name: One deployment step
+
+      - name: Run hunting session
         id: hunter
-        env:
-          MODE: ${{ inputs.mode || 'tick' }}
-          MIN_INTERVAL_SECONDS: ${{ github.event_name == 'workflow_dispatch' && '0' || '2700' }}
-          OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
-        run: python github_runner.py "$MODE" --min-interval-seconds "$MIN_INTERVAL_SECONDS"
-      - name: Stop schedule when deployment is complete or requires attention
-        if: always() && steps.hunter.outputs.terminal == 'true'
+        run: |
+          python github_runner.py tick \
+            --session-minutes "${{ inputs.session_minutes || 15 }}" \
+            --retry-interval "${{ inputs.retry_interval || 45 }}"
+
+      - name: Disable workflow on success
+        if: always() && steps.hunter.outputs.terminal == 'true' && steps.hunter.outputs.success == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/oci-a1.yml/disable"
+        run: |
+          echo "Máy chủ đã được tạo thành công! Tự động tắt workflow để tránh tạo trùng..."
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/oci-a1.yml/disable"

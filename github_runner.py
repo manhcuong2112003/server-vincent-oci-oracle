@@ -1,316 +1,254 @@
 #!/usr/bin/env python3
-"""A short, resumable deployment tick for GitHub Actions. No daemon or sleep loop."""
+"""
+Optimized Oracle A1 Hunter for GitHub Actions & Local execution.
+- Uses native OCI Python SDK (fast, resilient, no subprocess).
+- Session-based hunting: retries safely every 40-50s during a session (default 15 minutes).
+- Backs off smoothly on HTTP 429 (TooManyRequests).
+- Automatically captures public IP upon success and signals GitHub Actions to disable the workflow.
+"""
 import argparse
 import datetime as dt
 import json
 import os
 from pathlib import Path
-import tempfile
+import sys
 import time
-import uuid
 
-from oci_a1_hunter import API, Hunter, Stop, RateLimited, STACK, REGION, EMAIL, ACTIVE, log, rows
+try:
+    import oci
+except ImportError:
+    print("[ERROR] Thư viện 'oci' chưa được cài đặt. Vui lòng chạy: pip install oci")
+    sys.exit(1)
 
+# Cấu hình mặc định
+STACK_ID = "ocid1.ormstack.oc1.ap-singapore-1.amaaaaaagpymwhaatowy44ouukibise6bcbe5zgjtkau2bkxk5olkstupzua"
+REGION = "ap-singapore-1"
 
-class Busy(Stop):
-    pass
+def log(msg: str):
+    timestamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}", flush=True)
 
-
-class RemoteState:
-    """Persist intent before mutation; compare-and-swap protects remote state."""
-    def __init__(self, client, namespace, bucket):
-        self.client, self.namespace, self.bucket = client, namespace, bucket
-        self.etag = None
-        self.lease_etag = None
-        self.expires = 0
-
-    def get(self, name):
-        try:
-            result = self.client.get_object(self.namespace, self.bucket, name)
-        except Exception as exc:
-            if getattr(exc, "status", None) == 404:
-                return None, None
-            raise
-        return json.loads(result.data.content.decode("utf-8")), result.headers["etag"]
-
-    def put(self, name, data, etag):
-        condition = {"if_match": etag} if etag else {"if_none_match": "*"}
-        result = self.client.put_object(self.namespace, self.bucket, name,
-                                        json.dumps(data, ensure_ascii=False).encode("utf-8"),
-                                        content_type="application/json", **condition)
-        return result.headers["etag"]
-
-    def acquire(self):
-        previous, etag = self.get("lease.json")
-        if previous and previous.get("expires", 0) > time.time():
-            raise Busy("Runner khac dang giu lease. Bo qua lan nay.")
-        self.expires = time.time() + 900  # Workflow timeout is 5 minutes; lease lasts 15.
-        try:
-            self.lease_etag = self.put("lease.json", {"owner": uuid.uuid4().hex, "expires": self.expires}, etag)
-        except Exception as exc:
-            if getattr(exc, "status", None) == 412:
-                raise Busy("Runner khac vua lay lease; bo qua.") from exc
-            raise
-
-    def load(self):
-        data, self.etag = self.get("state.json")
-        return data
-
-    def save(self, data):
-        if not self.lease_etag or time.time() >= self.expires:
-            raise Stop("Lease het han; dung de tranh chay trung.")
-        self.etag = self.put("state.json", data, self.etag)
-
-    def release(self):
-        if self.lease_etag:
-            try:
-                self.put("lease.json", {"expires": 0}, self.lease_etag)
-            except Exception:
-                log("Khong release duoc lease; no se tu het han sau toi da 15 phut.")
-
-
-def planned_boot(plan):
-    instance = next(item for item in plan["resource_changes"] if item.get("type") == "oci_core_instance")
-    source = instance["change"]["after"]["source_details"][0]
-    return float(source.get("boot_volume_size_in_gbs") or 50)
-
-
-def audit_budget(api, tenancy, boot_gb):
-    """Conservatively count existing A1 and volumes in the same home region."""
-    compartments = rows(api.call("iam", "compartment", "list", "--compartment-id", tenancy,
-                                 "--compartment-id-in-subtree", "true", "--access-level", "ANY", "--all"))
-    ids = [tenancy] + [item["id"] for item in compartments if item.get("lifecycle-state") == "ACTIVE"]
-    domains = rows(api.call("iam", "availability-domain", "list", "--compartment-id", tenancy, "--all"))
-    used_cpu, used_ram, used_disk = 0.0, 0.0, 0.0
-    for compartment in dict.fromkeys(ids):
-        instances = rows(api.call("compute", "instance", "list", "--compartment-id", compartment, "--all"))
-        for item in instances:
-            if item.get("lifecycle-state") == "TERMINATED" or item.get("shape") != "VM.Standard.A1.Flex":
-                continue
-            config = item.get("shape-config") or {}
-            if config.get("ocpus") is None or config.get("memory-in-gbs") is None:
-                raise Stop("Khong doc duoc cau hinh A1 dang ton tai; khong Apply them.")
-            used_cpu += float(config["ocpus"])
-            used_ram += float(config["memory-in-gbs"])
-        volumes = list(rows(api.call("bv", "volume", "list", "--compartment-id", compartment, "--all")))
-        for domain in domains:
-            volumes += rows(api.call("bv", "boot-volume", "list", "--compartment-id", compartment,
-                                     "--availability-domain", domain["name"], "--all"))
-        for item in volumes:
-            if item.get("lifecycle-state") != "TERMINATED":
-                if item.get("size-in-gbs") is None:
-                    raise Stop("Khong doc duoc dung luong volume; khong Apply.")
-                used_disk += float(item["size-in-gbs"])
-    if used_cpu + 2 > 2 or used_ram + 12 > 12:
-        raise Stop("Tai khoan da co A1 dung %.1f OCPU / %.1f GB. Khong tao them vuot 2/12." % (used_cpu, used_ram))
-    if used_disk + boot_gb > 200:
-        raise Stop("Da co %.1f GB volume; ke hoach them %.1f GB se vuot tong 200 GB." % (used_disk, boot_gb))
-    log("Budget check OK: A1 hien co %.1f/%.1f; disk %.1f + %.1f <=200 GB."
-        % (used_cpu, used_ram, used_disk, boot_gb))
-
-
-def check_home(api, tenancy, region):
-    subscriptions = rows(api.call("iam", "region-subscription", "list", "--tenancy-id", tenancy))
-    if not any(item.get("region-name") == region and item.get("is-home-region") is True for item in subscriptions):
-        raise Stop("Region nay khong phai home region cua tai khoan. Khong tu tao tai nguyen o region khac.")
-
-
-class ShortHunter(Hunter):
-    def __init__(self, args, api, store):
-        self.store = store
-        saved = store.load()
-        if saved:
-            Path(args.state_dir, "state.json").write_text(json.dumps(saved), encoding="utf-8")
-        super().__init__(args, api)
-
-    def save(self):
-        super().save()
-        self.store.save(self.state)
-
-    def reconcile(self, jobs):
-        super().reconcile(jobs)
-        if not self.state.get("intent") and self.state.pop("intent_checks", None) is not None:
-            self.save()
-
-    def run_tick(self, tenancy, min_interval_seconds=0):
-        """Gate automatic wakeups under the same remote lease as deployment."""
-        now = time.time()
-        previous = self.state.get("last_tick_started_at")
-        # Terminal states and unsent mail need attention even between scans.
-        terminal_pending = any(self.state.get(key) for key in ("success", "stopped", "outbox"))
-        if min_interval_seconds and previous is not None and not terminal_pending:
-            remaining = previous + min_interval_seconds - now
-            if remaining > 0:
-                log("Chua du 45 phut; bo qua quet, con %.0f giay." % remaining)
-                return False
-        # Save before calling Oracle so delayed/duplicate wakeups and timeouts
-        # cannot cause multiple deployment attempts inside the interval.
-        self.state["last_tick_started_at"] = now
-        self.save()
-        log("Bat dau luot quet; khoang cach toi thieu %s giay." % min_interval_seconds)
-        terminal = self.tick(tenancy)
-        self.state["last_tick_finished_at"] = time.time()
-        self.save()
-        return terminal
-
-    def finish_plan(self, tenancy):
-        deadline = time.monotonic() + 60
-        while True:
-            job = self.job(self.state["pending"])
-            status = job.get("lifecycle-state")
-            if status not in ACTIVE:
-                break
-            if time.monotonic() >= deadline:
-                log("Plan van dang chay; lan schedule sau tiep tuc.")
-                return False
-            time.sleep(10)
-        if status != "SUCCEEDED" or job.get("operation") != "PLAN":
-            raise Stop("Plan chua thanh cong: " + self.job_url(job["id"]))
-        self.fingerprint()
-        self.plan(job["id"])
-        audit_budget(self.api, tenancy, planned_boot(self.last_plan))
-        self.submit("APPLY", job["id"])
-        return False
-
-    def tick(self, tenancy):
-        if self.state.get("stopped"):
-            self.flush_mail()
-            log("Da dung vi loi; can review truoc khi chay lai: " + self.state["stopped"])
-            return True
-        if not self.state.get("subscription"):
-            log("Chay mode setup truoc de tao email subscription.")
-            return False
-        subscription = self.api.call("ons", "subscription", "get",
-                                     "--subscription-id", self.state["subscription"])["data"]
-        if subscription.get("lifecycle-state") != "ACTIVE":
-            log("Cho ban bam Confirm subscription trong Gmail; chua gui job moi.")
-            return False
-        self.require_email()
-        if self.state.get("success"):
-            self.success({"id": self.state["success"]})
-            return True
-        self.fingerprint()
-        jobs = self.jobs()
-        self.reconcile(jobs)
-        if self.state.get("pending"):
-            job = self.job(self.state["pending"])
-            status, operation = job.get("lifecycle-state"), job.get("operation")
-            if operation == "PLAN" and (status in ACTIVE or status == "SUCCEEDED"):
-                return self.finish_plan(tenancy)
-            if status in ACTIVE:
-                log("%s dang %s; lan schedule sau se kiem tra tiep." % (operation, status))
-                return False
-            if status == "SUCCEEDED" and operation == "APPLY":
-                self.success(job)
-                return True
-            if status != "FAILED" or operation != "APPLY":
-                raise Stop("Job ket thuc %s/%s: %s" % (operation, status, self.job_url(job["id"])))
-            self.check_capacity(job)
-            self.state.pop("pending", None)
-            self.save()
-        else:
-            applies = [item for item in jobs if item.get("operation") == "APPLY"]
-            if applies:
-                latest = applies[0]
-                if latest.get("lifecycle-state") == "SUCCEEDED":
-                    self.success(latest)
-                    return True
-                if latest.get("lifecycle-state") != "FAILED":
-                    raise Stop("Apply gan nhat khong ro trang thai. Kiem tra Console.")
-                self.check_capacity(latest)
-        self.submit("PLAN")
-        return self.finish_plan(tenancy)
-
-
-def output_terminal(value):
+def output_github(key: str, value: str):
     path = os.environ.get("GITHUB_OUTPUT")
     if path:
-        with open(path, "a", encoding="utf-8") as stream:
-            stream.write("terminal=%s\n" % str(value).lower())
+        try:
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(f"{key}={value}\n")
+        except Exception as e:
+            log(f"Không ghi được GITHUB_OUTPUT: {e}")
 
+def get_oci_clients(config_path=None, region=REGION):
+    try:
+        if config_path and Path(config_path).exists():
+            config = oci.config.from_file(config_path)
+        else:
+            config = oci.config.from_file()
+    except Exception:
+        # Fallback đọc trực tiếp từ Environment Variables nếu có
+        user = os.environ.get("OCI_USER_OCID")
+        tenancy = os.environ.get("OCI_TENANCY_OCID")
+        fingerprint = os.environ.get("OCI_FINGERPRINT")
+        key_content = os.environ.get("OCI_PRIVATE_KEY")
+        if user and tenancy and fingerprint and key_content:
+            config = {
+                "user": user.strip(),
+                "tenancy": tenancy.strip(),
+                "fingerprint": fingerprint.strip(),
+                "key_content": key_content.strip(),
+                "region": region,
+            }
+        else:
+            raise RuntimeError("Không tìm thấy cấu hình OCI (~/.oci/config hoặc OCI_* env vars).")
+
+    config["region"] = region
+    rm_client = oci.resource_manager.ResourceManagerClient(config)
+    compute_client = oci.core.ComputeClient(config)
+    network_client = oci.core.VirtualNetworkClient(config)
+    identity_client = oci.identity.IdentityClient(config)
+    return config, rm_client, compute_client, network_client, identity_client
+
+def check_existing_a1(config, compute_client):
+    """Kiểm tra xem tài khoản đã có máy A1 nào đang chạy chưa."""
+    instances = compute_client.list_instances(compartment_id=config["tenancy"]).data
+    active_a1 = [
+        inst for inst in instances
+        if inst.shape == "VM.Standard.A1.Flex" and inst.lifecycle_state in ["RUNNING", "PROVISIONING", "STARTING"]
+    ]
+    return active_a1
+
+def run_session(stack_id: str, region: str, session_minutes: int, retry_interval: int):
+    log("=" * 65)
+    log("   ORACLE CLOUD A1 ALWAYS FREE HUNTER - PHIÊN TỐI ƯU")
+    log("=" * 65)
+    log(f" - Stack ID: {stack_id}")
+    log(f" - Region: {region}")
+    log(f" - Thời gian phiên săn: {session_minutes} phút")
+    log(f" - Giãn cách thử lại: {retry_interval} giây/lần")
+    log("=" * 65)
+
+    config, rm_client, compute_client, network_client, _ = get_oci_clients(region=region)
+    tenancy_id = config["tenancy"]
+
+    # 1. Kiểm tra xem đã có máy A1 tạo từ trước chưa
+    existing_a1 = check_existing_a1(config, compute_client)
+    if existing_a1:
+        inst = existing_a1[0]
+        log(f"🎉 Máy chủ A1 đã tồn tại trong tài khoản: {inst.display_name} (State: {inst.lifecycle_state})")
+        output_github("terminal", "true")
+        output_github("success", "true")
+        return 0
+
+    session_start = time.time()
+    session_timeout = session_minutes * 60
+    attempt = 1
+
+    while True:
+        elapsed = time.time() - session_start
+        if elapsed >= session_timeout:
+            log(f"\n[HẾT GIỜ PHIÊN] Đã chạy xong {session_minutes} phút của phiên hiện tại mà chưa có dung lượng.")
+            log("Kết thúc phiên êm ái để đợi lần kích hoạt tiếp theo từ GitHub Actions.")
+            output_github("terminal", "false")
+            output_github("success", "false")
+            return 0
+
+        # Kiểm tra nếu đang có job khác đang chạy dở trên Stack
+        try:
+            recent_jobs = rm_client.list_jobs(compartment_id=tenancy_id, stack_id=stack_id).data
+            active_jobs = [j for j in recent_jobs if j.lifecycle_state in ["ACCEPTED", "IN_PROGRESS"]]
+            if active_jobs:
+                running_job = active_jobs[0]
+                log(f"⏳ Có Job {running_job.display_name} đang chạy, đợi 15s...")
+                time.sleep(15)
+                continue
+        except Exception as e:
+            log(f"Cảnh báo kiểm tra job cũ: {e}")
+
+        # Gửi lệnh Apply
+        job_name = f"a1-hunt-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        log(f"\n[Lần thử #{attempt} | Phút {int(elapsed // 60)}/{session_minutes}] Gửi lệnh Apply vào Stack...")
+
+        try:
+            create_job_details = oci.resource_manager.models.CreateJobDetails(
+                stack_id=stack_id,
+                display_name=job_name,
+                operation="APPLY",
+                apply_job_plan_resolution=oci.resource_manager.models.CreateApplyJobPlanResolutionDetails(
+                    is_auto_approved=True
+                )
+            )
+            job = rm_client.create_job(create_job_details).data
+            job_id = job.id
+
+            # Chờ job hoàn tất
+            while True:
+                time.sleep(10)
+                current_job = rm_client.get_job(job_id).data
+                state = current_job.lifecycle_state
+
+                if state == "SUCCEEDED":
+                    log("\n" + "=" * 65)
+                    log("🎉🎉🎉 CHÚC MỪNG! ĐÃ TẠO THÀNH CÔNG SERVER ARM A1! 🎉🎉🎉")
+                    log("=" * 65)
+
+                    # Tìm IP của máy vừa tạo
+                    time.sleep(5)
+                    active_a1 = check_existing_a1(config, compute_client)
+                    for inst in active_a1:
+                        log(f" - Tên máy: {inst.display_name}")
+                        log(f" - Trạng thái: {inst.lifecycle_state}")
+                        log(f" - OCID: {inst.id}")
+                        try:
+                            vnics = compute_client.list_vnic_attachments(compartment_id=tenancy_id, instance_id=inst.id).data
+                            for vnic in vnics:
+                                v = network_client.get_vnic(vnic.vnic_id).data
+                                log(f" - IP Public: {v.public_ip}")
+                                log(f" - IP Private: {v.private_ip}")
+                        except Exception as ve:
+                            log(f"Không lấy được IP: {ve}")
+
+                    output_github("terminal", "true")
+                    output_github("success", "true")
+                    return 0
+
+                elif state in ["FAILED", "CANCELED"]:
+                    # Đọc log lỗi
+                    is_out_of_capacity = False
+                    is_rate_limited = False
+                    try:
+                        logs = rm_client.get_job_logs(job_id).data
+                        for entry in logs:
+                            msg = entry.message
+                            if "Out of host capacity" in msg or "500-InternalError" in msg:
+                                is_out_of_capacity = True
+                            if "TooManyRequests" in msg or "429" in msg:
+                                is_rate_limited = True
+                    except Exception:
+                        pass
+
+                    if is_out_of_capacity:
+                        log("⏳ Oracle báo: Hết chỗ trống tạm thời (Out of host capacity).")
+                    elif is_rate_limited:
+                        log("⚠️ Oracle cảnh báo tần suất (429). Tự động nghỉ 90s...")
+                        time.sleep(90)
+                    else:
+                        log(f"⚠️ Job kết thúc với trạng thái: {state}")
+
+                    break
+
+        except oci.exceptions.ServiceError as se:
+            if se.status == 429:
+                log("⚠️ Bị Rate Limit (HTTP 429). Tự động nghỉ 90s...")
+                time.sleep(90)
+            else:
+                log(f"Lỗi OCI Service ({se.status}): {se.message}")
+        except Exception as ex:
+            log(f"Lỗi ngoại lệ: {ex}")
+
+        attempt += 1
+        log(f"Chờ {retry_interval}s trước lượt tiếp theo...")
+        try:
+            time.sleep(retry_interval)
+        except KeyboardInterrupt:
+            log("Người dùng bấm dừng.")
+            output_github("terminal", "false")
+            return 0
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "tick", "status"])
-    parser.add_argument("--stack-id", default=STACK)
-    parser.add_argument("--region", default=REGION)
-    parser.add_argument("--email", default=EMAIL)
-    parser.add_argument("--min-interval-seconds", type=int, choices=(0, 2700), default=0,
-                        help="2700 for automatic wakeups; 0 for an explicit manual tick")
-    args = parser.parse_args()
-    # Imported only for real execution; pure logic is testable without OCI credentials.
-    import oci
-    config = oci.config.from_file()
-    config["region"] = args.region
-    oci.config.validate_config(config)
-    client = oci.object_storage.ObjectStorageClient(config, retry_strategy=oci.retry.NoneRetryStrategy(), timeout=(10, 60))
-    namespace = client.get_namespace().data
-    api = API(args.region)
-    check_home(api, config["tenancy"], args.region)
-    bucket = "vincent-a1-state-" + args.stack_id[-8:]
-    try:
-        client.get_bucket(namespace, bucket)
-    except oci.exceptions.ServiceError as exc:
-        if exc.status != 404 or args.command != "setup":
-            raise Stop("Khong doc duoc bucket state; chay setup truoc hoac kiem tra IAM.") from exc
-        compartment = api.call("resource-manager", "stack", "get", "--stack-id", args.stack_id)["data"]["compartment-id"]
-        client.create_bucket(namespace, oci.object_storage.models.CreateBucketDetails(
-            name=bucket, compartment_id=compartment, public_access_type="NoPublicAccess", storage_tier="Standard"))
-    store = RemoteState(client, namespace, bucket)
-    try:
-        store.acquire()
-    except Busy as exc:
-        log(str(exc))
-        return 0
-    # Keep local state alive while the error handler persists the stop reason
-    # and pending notification to Object Storage.
-    with tempfile.TemporaryDirectory() as directory:
-        args.state_dir = directory
-        hunter = None
-        try:
-            hunter = ShortHunter(args, api, store)
-            if args.command == "setup":
-                hunter.setup_email()
-                return 0
-            if args.command == "status":
-                log("Stack: %s; success=%s; pending=%s; stopped=%s" % (
-                    args.stack_id, hunter.state.get("success"), hunter.state.get("pending"), hunter.state.get("stopped")))
-                started = hunter.state.get("last_tick_started_at")
-                if started is not None:
-                    log("Luot quet gan nhat (UTC): " + dt.datetime.fromtimestamp(
-                        started, dt.timezone.utc).isoformat(timespec="seconds"))
-                return 0
-            terminal = hunter.run_tick(config["tenancy"], args.min_interval_seconds)
-            output_terminal(terminal)
-            return 0
-        except RateLimited as exc:
-            log(str(exc))
-            log("Tam hoan vi Oracle gioi han tan suat; giu lich, khong gui lai job trong luot nay.")
-            output_terminal(False)
-            return 0
-        except (Stop, oci.exceptions.ServiceError, ValueError) as exc:
-            log("DUNG: " + str(exc))
-            if hunter:
-                if hunter.state.get("success") or hunter.state.get("outbox"):
-                    # Leave delivery resumable. Do not overwrite an unsent success notice.
-                    log("Thong bao chua gui xong; giu schedule de thu gui lai.")
-                elif hunter.state.get("intent") and hunter.state.get("intent_checks", 0) < 3:
-                    hunter.state["intent_checks"] = hunter.state.get("intent_checks", 0) + 1
-                    hunter.save()
-                    log("Chua ro ket qua gui job; giu schedule de tim lai, khong gui job trung.")
-                else:
-                    hunter.state["stopped"] = str(exc)
-                    hunter.save()
-                    hunter.notify("OCI A1: action required", str(exc), "stopped")
-                    output_terminal(True)
-            return 2
-        finally:
-            store.release()
+    parser = argparse.ArgumentParser(description="Oracle A1 Capacity Hunter (Optimized)")
+    parser.add_argument("mode", nargs="?", default="tick", choices=["tick", "setup", "status"],
+                        help="Mode: tick (mặc định săn), status (kiểm tra), setup (kiểm tra kết nối)")
+    parser.add_argument("--stack-id", default=STACK_ID, help="Stack OCID")
+    parser.add_argument("--region", default=REGION, help="OCI Region")
+    parser.add_argument("--session-minutes", type=int, default=15, help="Thời gian mỗi phiên săn (phút)")
+    parser.add_argument("--retry-interval", type=int, default=45, help="Khoảng cách giữa các lần thử (giây)")
+    parser.add_argument("--min-interval-seconds", type=int, default=0, help="Dành cho tương thích cũ")
 
+    args = parser.parse_args()
+
+    if args.mode == "status":
+        config, rm_client, compute_client, _, identity_client = get_oci_clients(region=args.region)
+        user = identity_client.get_user(config["user"]).data
+        log(f"User: {user.name} ({user.lifecycle_state})")
+        existing = check_existing_a1(config, compute_client)
+        log(f"Số máy A1 đang chạy: {len(existing)}")
+        for i in existing:
+            log(f" - {i.display_name}: {i.lifecycle_state}")
+        return 0
+
+    if args.mode == "setup":
+        config, rm_client, _, _, identity_client = get_oci_clients(region=args.region)
+        user = identity_client.get_user(config["user"]).data
+        stack = rm_client.get_stack(args.stack_id).data
+        log(f"Kết nối thành công! User: {user.name}, Stack: {stack.display_name} ({stack.lifecycle_state})")
+        return 0
+
+    # Chế độ mặc định: Săn theo phiên
+    return run_session(
+        stack_id=args.stack_id,
+        region=args.region,
+        session_minutes=args.session_minutes,
+        retry_interval=args.retry_interval
+    )
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (Stop, OSError) as error:
-        log("DUNG: " + str(error))
-        raise SystemExit(2)
+    sys.exit(main() or 0)
